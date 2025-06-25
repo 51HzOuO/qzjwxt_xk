@@ -8,10 +8,19 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
+
+// CourseSession represents a course selection session
+type CourseSession struct {
+	Term string // 学年学期
+	Name string // 选课名称
+	Time string // 选课时间
+	URL  string // 选课URL
+}
 
 // Course represents a course from the response
 type Course struct {
@@ -83,6 +92,8 @@ func main() {
 	cookies, err := login(encoded)
 	if err != nil {
 		fmt.Printf("登录失败: %v\n", err)
+		fmt.Println("按任意键退出...")
+		reader.ReadString('\n')
 		return
 	}
 
@@ -157,13 +168,26 @@ func login(encoded string) ([]*http.Cookie, error) {
 	if resp.StatusCode != 302 {
 		// If we got 200, it means there was an error (login page with error message)
 		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+
 		fmt.Println("\n登录失败! 响应体预览:")
 		previewLen := 500
 		if len(body) < previewLen {
 			previewLen = len(body)
 		}
 		fmt.Printf("%s\n", body[:previewLen])
-		return nil, fmt.Errorf("登录失败，状态码: %d", resp.StatusCode)
+
+		// Try to extract more specific error messages
+		errorMsg := "登录失败"
+		if strings.Contains(bodyStr, "密码错误") || strings.Contains(bodyStr, "密码不正确") {
+			errorMsg = "密码错误"
+		} else if strings.Contains(bodyStr, "账号不存在") || strings.Contains(bodyStr, "用户名不存在") {
+			errorMsg = "账号不存在"
+		} else if strings.Contains(bodyStr, "验证码") && strings.Contains(bodyStr, "错误") {
+			errorMsg = "验证码错误"
+		}
+
+		return nil, fmt.Errorf("%s", errorMsg)
 	}
 
 	// Print all headers for debugging
@@ -198,9 +222,49 @@ func login(encoded string) ([]*http.Cookie, error) {
 
 // authenticate sends an authentication request
 func authenticate(cookies []*http.Cookie) error {
-	req, err := http.NewRequest("GET",
-		"https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxk/xsxk_index?jx0502zbid=C260FE8330C34E8ABECB82E9ED5CE241",
-		nil)
+	// First, get the list of available course selection sessions
+	sessions, err := getSessionList(cookies)
+	if err != nil {
+		return fmt.Errorf("failed to get session list: %v", err)
+	}
+
+	// Display available sessions to the user
+	fmt.Println("\n可用的选课会话:")
+	fmt.Printf("%-4s %-15s %-20s %-25s\n", "序号", "学年学期", "选课名称", "选课时间")
+	fmt.Println(strings.Repeat("-", 70))
+
+	for i, session := range sessions {
+		fmt.Printf("%-4d %-15s %-20s %-25s\n", i+1, session.Term, session.Name, session.Time)
+	}
+
+	// Let user select a session
+	reader := bufio.NewReader(os.Stdin)
+	var selectedSession CourseSession
+
+	// Always require manual selection, even if there's only one option
+	for {
+		fmt.Print("\n请选择选课会话编号: ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		// Convert input to integer
+		var sessionIndex int
+		_, err := fmt.Sscanf(input, "%d", &sessionIndex)
+		if err != nil || sessionIndex < 1 || sessionIndex > len(sessions) {
+			fmt.Printf("无效的选择，请输入 1-%d 之间的数字\n", len(sessions))
+			continue
+		}
+
+		selectedSession = sessions[sessionIndex-1]
+		break
+	}
+
+	fmt.Printf("\n已选择: %s - %s\n", selectedSession.Term, selectedSession.Name)
+	fmt.Printf("使用URL: %s\n", selectedSession.URL)
+
+	// Send authentication request with the selected session URL
+	authURL := "https://jw.educationgroup.cn" + selectedSession.URL
+	req, err := http.NewRequest("GET", authURL, nil)
 	if err != nil {
 		return err
 	}
@@ -220,9 +284,26 @@ func authenticate(cookies []*http.Cookie) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("authentication failed with status code: %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		if len(body) > 0 {
+			previewLen := 200
+			if len(body) < previewLen {
+				previewLen = len(body)
+			}
+			fmt.Printf("认证响应预览: %s\n", body[:previewLen])
+		}
+		return fmt.Errorf("认证失败，状态码: %d", resp.StatusCode)
 	}
 
+	// Check if the response contains indicators of successful authentication
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	if strings.Contains(bodyStr, "权限不足") || strings.Contains(bodyStr, "请重新登录") {
+		return fmt.Errorf("认证失败: 权限不足或会话已过期，请重新登录")
+	}
+
+	fmt.Println("认证成功!")
 	return nil
 }
 
@@ -262,32 +343,9 @@ func getCourseList(cookies []*http.Cookie) (map[string]string, error) {
 		return nil, err
 	}
 
-	// Debug: Print first 200 characters of response
-	if len(body) > 0 {
-		previewLen := 200
-		if len(body) < previewLen {
-			previewLen = len(body)
-		}
-		fmt.Printf("Response preview: %s\n", body[:previewLen])
-	}
-
 	// Check if response is HTML instead of JSON
 	if strings.Contains(string(body), "<html") {
-		fmt.Println("Received HTML response instead of JSON. Session might have expired or authentication failed.")
-
-		// Create a mock course map for testing
-		mockCourseMap := map[string]string{
-			"B0802504": "202520261000290",
-			"B0802464": "202520261000235",
-		}
-
-		fmt.Println("\n使用模拟数据进行测试:")
-		fmt.Println("课程号\t课程名称")
-		fmt.Println("-----------------")
-		fmt.Println("B0802504\t外国高等教育专题")
-		fmt.Println("B0802464\t品牌学")
-
-		return mockCourseMap, nil
+		return nil, fmt.Errorf("received HTML response instead of JSON, session might have expired or authentication failed")
 	}
 
 	var courseResp CourseResponse
@@ -511,3 +569,304 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 
 // Global variable for course map
 var courseMap map[string]string
+
+// getSessionList fetches the list of available course selection sessions
+func getSessionList(cookies []*http.Cookie) ([]CourseSession, error) {
+	req, err := http.NewRequest("GET", "https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxk/xklc_list", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Host", "jw.educationgroup.cn")
+
+	// Add cookies to request
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("failed to get session list with status code: %d", resp.StatusCode)
+	}
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	html := string(body)
+
+	// Extract all table rows with a more specific pattern for the table format
+	var sessions []CourseSession
+	sessionMap := make(map[string]CourseSession) // Use a map to avoid duplicates
+
+	// Step 1: Try to find the specific table by ID or class
+	tablePattern := regexp.MustCompile(`<table[^>]*(?:id=["']?tbKxkc["']?|class=["']?Nsb_r_list Nsb_table["']?)[^>]*>(?s:.*?)</table>`)
+	tableMatch := tablePattern.FindString(html)
+
+	if tableMatch != "" {
+		fmt.Println("找到选课表格")
+
+		// Step 2: Extract all rows from the table
+		rowPattern := regexp.MustCompile(`<tr>[\s\S]*?</tr>`)
+		allRows := rowPattern.FindAllString(tableMatch, -1)
+
+		// Filter out header rows
+		var dataRows []string
+		for _, row := range allRows {
+			// Skip rows that contain header cells or have the specific style attribute
+			if !strings.Contains(row, "<th") && !strings.Contains(row, "background-color:#D1E4F8") {
+				dataRows = append(dataRows, row)
+			}
+		}
+
+		if len(dataRows) > 0 {
+			fmt.Printf("找到 %d 行选课会话信息\n", len(dataRows))
+
+			for _, rowHTML := range dataRows {
+				// Remove HTML comments to avoid confusion
+				rowWithoutComments := removeHTMLComments(rowHTML)
+
+				// Extract the text from each cell
+				cellPattern := regexp.MustCompile(`<td[^>]*>([\s\S]*?)</td>`)
+				cellMatches := cellPattern.FindAllStringSubmatch(rowWithoutComments, -1)
+
+				if len(cellMatches) >= 3 {
+					// First three cells should contain term, name, and time
+					term := strings.TrimSpace(cellMatches[0][1])
+					name := strings.TrimSpace(cellMatches[1][1])
+
+					// Try to extract time from the third cell
+					timeStr := ""
+					if len(cellMatches) >= 3 {
+						timeStr = strings.TrimSpace(cellMatches[2][1])
+					}
+
+					// If time is empty, try to find it in any cell by looking for time patterns
+					if timeStr == "" {
+						timePattern := regexp.MustCompile(`\d{4}-\d{2}-\d{2}.*?~.*?\d{4}-\d{2}-\d{2}`)
+						for _, cell := range cellMatches {
+							if timeMatch := timePattern.FindString(cell[1]); timeMatch != "" {
+								timeStr = timeMatch
+								break
+							}
+						}
+					}
+
+					// If we still don't have time, look for the cell containing a date pattern
+					if timeStr == "" {
+						datePattern := regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
+						for _, cell := range cellMatches {
+							if dateMatch := datePattern.FindString(cell[1]); dateMatch != "" {
+								timeStr = strings.TrimSpace(cell[1])
+								break
+							}
+						}
+					}
+
+					// Extract the last cell for operation links
+					operationCell := cellMatches[len(cellMatches)-1][1]
+
+					// Extract links from the operation cell
+					linkPattern := regexp.MustCompile(`<a[^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)</a>`)
+					linkMatches := linkPattern.FindAllStringSubmatch(operationCell, -1)
+
+					for _, linkMatch := range linkMatches {
+						href := linkMatch[1]
+						linkText := strings.TrimSpace(linkMatch[2])
+
+						// Clean HTML tags from extracted text
+						cleanText := func(s string) string {
+							// Remove HTML tags
+							noTags := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(s, "")
+							return strings.TrimSpace(noTags)
+						}
+
+						term = cleanText(term)
+						name = cleanText(name)
+						timeStr = cleanText(timeStr)
+
+						fmt.Printf("从表格提取: 学期=%s, 名称=%s, 时间=%s, 操作=%s\n",
+							term, name, timeStr, linkText)
+
+						// Convert xklc_view URLs to xsxk_index URLs if needed
+						sessionURL := href
+
+						// Extract all parameters from the URL without assuming specific names
+						if strings.Contains(sessionURL, "xklc_view") {
+							// Split the URL to get the path and parameters
+							urlParts := strings.SplitN(sessionURL, "?", 2)
+							if len(urlParts) == 2 {
+								basePath := strings.Replace(urlParts[0], "xklc_view", "xsxk_index", 1)
+								sessionURL = basePath + "?" + urlParts[1]
+								fmt.Printf("转换URL: %s => %s\n", href, sessionURL)
+							}
+						}
+
+						// Use the full URL as the key for deduplication (don't rely on specific parameters)
+						sessionKey := sessionURL
+
+						sessionMap[sessionKey] = CourseSession{
+							Term: term,
+							Name: name,
+							Time: timeStr,
+							URL:  sessionURL,
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If we couldn't extract from the table, try other approaches
+	if len(sessionMap) == 0 {
+		fmt.Println("未从表格中提取到选课会话，尝试通用提取方法...")
+
+		// Look for any a tags with href containing xklc_view or xsxk_index
+		linkPattern := regexp.MustCompile(`<a[^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)</a>`)
+		linkMatches := linkPattern.FindAllStringSubmatch(html, -1)
+
+		var selectionLinks [][]string
+		for _, match := range linkMatches {
+			href := match[1]
+			linkText := match[2]
+
+			if (strings.Contains(href, "xsxk") || strings.Contains(href, "xklc")) &&
+				(strings.Contains(linkText, "选课") || strings.Contains(linkText, "进入")) {
+				selectionLinks = append(selectionLinks, match)
+			}
+		}
+
+		fmt.Printf("找到 %d 个可能的选课链接\n", len(selectionLinks))
+
+		for _, match := range selectionLinks {
+			href := match[1]
+			linkText := strings.TrimSpace(match[2])
+
+			// Try to find the containing table row to extract metadata
+			// Create a regex pattern that will match a <tr> containing this href
+			escapedHref := regexp.QuoteMeta(href)
+			rowPattern := regexp.MustCompile(`<tr>[\s\S]*?` + escapedHref + `[\s\S]*?</tr>`)
+			rowMatch := rowPattern.FindString(html)
+
+			// Default values
+			term := "当前学期"
+			name := linkText
+			timeStr := "当前时间"
+
+			if rowMatch != "" {
+				// Remove HTML comments to avoid confusion
+				rowMatch = removeHTMLComments(rowMatch)
+
+				// Extract cells from the row
+				cellPattern := regexp.MustCompile(`<td[^>]*>([\s\S]*?)</td>`)
+				cellMatches := cellPattern.FindAllStringSubmatch(rowMatch, -1)
+
+				if len(cellMatches) >= 3 {
+					// Try to extract text content without HTML tags
+					extractText := func(html string) string {
+						// Remove HTML tags
+						noTags := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(html, "")
+						// Trim whitespace
+						return strings.TrimSpace(noTags)
+					}
+
+					// First three cells should contain term, name, and time
+					term = extractText(cellMatches[0][1])
+					name = extractText(cellMatches[1][1])
+
+					// Try to extract time from the third cell
+					if len(cellMatches) >= 3 {
+						timeStr = extractText(cellMatches[2][1])
+					}
+
+					// If time is empty, try to find it in any cell by looking for time patterns
+					if timeStr == "" || timeStr == "当前时间" {
+						timePattern := regexp.MustCompile(`\d{4}-\d{2}-\d{2}.*?~.*?\d{4}-\d{2}-\d{2}`)
+						for _, cell := range cellMatches {
+							if timeMatch := timePattern.FindString(cell[1]); timeMatch != "" {
+								timeStr = extractText(timeMatch)
+								break
+							}
+						}
+					}
+
+					// If we still don't have time, look for the cell containing a date pattern
+					if timeStr == "" || timeStr == "当前时间" {
+						datePattern := regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
+						for _, cell := range cellMatches {
+							if dateMatch := datePattern.FindString(cell[1]); dateMatch != "" {
+								timeStr = extractText(cell[1])
+								break
+							}
+						}
+					}
+				}
+			}
+
+			// Convert xklc_view URLs to xsxk_index URLs if needed
+			sessionURL := href
+
+			// Extract all parameters from the URL without assuming specific names
+			if strings.Contains(sessionURL, "xklc_view") {
+				// Split the URL to get the path and parameters
+				urlParts := strings.SplitN(sessionURL, "?", 2)
+				if len(urlParts) == 2 {
+					basePath := strings.Replace(urlParts[0], "xklc_view", "xsxk_index", 1)
+					sessionURL = basePath + "?" + urlParts[1]
+					fmt.Printf("转换URL: %s => %s\n", href, sessionURL)
+				}
+			}
+
+			// Use the full URL as the key for deduplication
+			sessionKey := sessionURL
+
+			// Extract all parameters for logging purposes only
+			paramPattern := regexp.MustCompile(`([a-zA-Z0-9_]+)=([^&]+)`)
+			paramMatches := paramPattern.FindAllStringSubmatch(sessionURL, -1)
+			for _, paramMatch := range paramMatches {
+				if len(paramMatch) >= 3 {
+					paramName := paramMatch[1]
+					paramValue := paramMatch[2]
+					fmt.Printf("提取到参数: %s=%s\n", paramName, paramValue)
+				}
+			}
+
+			sessionMap[sessionKey] = CourseSession{
+				Term: term,
+				Name: name,
+				Time: timeStr,
+				URL:  sessionURL,
+			}
+		}
+	}
+
+	// Convert map to slice
+	for _, session := range sessionMap {
+		sessions = append(sessions, session)
+	}
+
+	if len(sessions) > 0 {
+		fmt.Printf("\n找到 %d 个唯一的选课会话\n", len(sessions))
+		for i, session := range sessions {
+			fmt.Printf("会话 %d: %s - %s - %s - %s\n", i+1, session.Term, session.Name, session.Time, session.URL)
+		}
+		return sessions, nil
+	}
+
+	// If we still couldn't find any sessions, return an error
+	return nil, fmt.Errorf("无法从响应中提取选课会话信息")
+}
+
+// removeHTMLComments removes HTML comments from a string
+func removeHTMLComments(html string) string {
+	commentPattern := regexp.MustCompile(`<!--[\s\S]*?-->`)
+	return commentPattern.ReplaceAllString(html, "")
+}
