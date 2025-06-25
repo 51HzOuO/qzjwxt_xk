@@ -5,9 +5,9 @@ echo "Building macOS executable..."
 
 # Set environment variables for native compilation
 export GOOS=darwin
-export GOARCH=amd64
+export GOARCH=arm64
 
 # Compile the application
-go build -o main_darwin main.go
+go build -o qzjwxt_xk_macos_arm64 main.go
 
-echo "Build complete: main_darwin" 
+echo "Build complete: qzjwxt_xk_macos_arm64 (macOS ARM64)" 

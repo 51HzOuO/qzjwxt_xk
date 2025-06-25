@@ -8,6 +8,6 @@ export GOOS=windows
 export GOARCH=amd64
 
 # Compile the application
-go build -o main_windows.exe main.go
+go build -o qzjwxt_xk_windows_amd64.exe main.go
 
-echo "Build complete: main_windows.exe" 
+echo "Build complete: qzjwxt_xk_windows_amd64.exe (Windows AMD64)" 

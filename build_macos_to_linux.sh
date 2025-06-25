@@ -8,6 +8,6 @@ export GOOS=linux
 export GOARCH=amd64
 
 # Compile the application
-go build -o main_linux main.go
+go build -o qzjwxt_xk_linux_amd64 main.go
 
-echo "Build complete: main_linux" 
+echo "Build complete: qzjwxt_xk_linux_amd64 (Linux AMD64)" 

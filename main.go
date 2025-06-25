@@ -44,6 +44,21 @@ type CourseResponse struct {
 }
 
 func main() {
+	// Display disclaimer at startup
+	fmt.Println("==============================================================================")
+	fmt.Println("⚠️  警告：请勿使用该项目进行任何形式的商业盈利行为，包括但不限于收费服务、转售代码、嵌入付费软件等。")
+	fmt.Println()
+	fmt.Println("本项目旨在提供便捷的选课辅助工具，仅供学习与个人使用。")
+	fmt.Println()
+	fmt.Println("如需在公开平台分发、修改或复用本项目，请确保遵守GPL 协议条款，并注明原作者及项目来源。")
+	fmt.Println()
+	fmt.Println("感谢你的理解与支持。如果你有建议或改进意见，欢迎通过 Issue 或 Pull Request 的方式进行交流。")
+	fmt.Println()
+	fmt.Println("GitHub repo:")
+	fmt.Println("https://github.com/51HzOuO/qzjwxt_xk")
+	fmt.Println("==============================================================================")
+	fmt.Println()
+
 	// Step 1: Get username and password from user input
 	reader := bufio.NewReader(os.Stdin)
 
