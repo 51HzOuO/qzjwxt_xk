@@ -526,14 +526,6 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 			for {
 				attempts++
 
-				// Refresh authentication before each attempt to ensure the session is valid
-				err := refreshAuthentication(cookies)
-				if err != nil {
-					fmt.Printf("课程 %s: 认证刷新失败: %v，等待重试...\n", kch, err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-
 				url := fmt.Sprintf("https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/ggxxkxkOper?cfbs=null&jx0404id=%s&xkzy=&trjf=&_=%d",
 					jx0404id, time.Now().UnixMilli())
 
