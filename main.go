@@ -827,7 +827,7 @@ func getSessionList(cookies []*http.Cookie) ([]CourseSession, error) {
 						fmt.Printf("从表格提取: 学期=%s, 名称=%s, 时间=%s, 操作=%s\n",
 							term, name, timeStr, linkText)
 
-						// Convert xklc_view URLs to xsxk_index URLs if needed
+						// Convert xklc_view URLs to yxxsxk_index URLs if needed
 						sessionURL := href
 
 						// Extract all parameters from the URL without assuming specific names
@@ -835,7 +835,15 @@ func getSessionList(cookies []*http.Cookie) ([]CourseSession, error) {
 							// Split the URL to get the path and parameters
 							urlParts := strings.SplitN(sessionURL, "?", 2)
 							if len(urlParts) == 2 {
-								basePath := strings.Replace(urlParts[0], "xklc_view", "xsxk_index", 1)
+								basePath := strings.Replace(urlParts[0], "xklc_view", "yxxsxk_index", 1)
+								sessionURL = basePath + "?" + urlParts[1]
+								fmt.Printf("转换URL: %s => %s\n", href, sessionURL)
+							}
+						} else if strings.Contains(sessionURL, "xsxk_index") {
+							// Also convert any xsxk_index URLs to yxxsxk_index
+							urlParts := strings.SplitN(sessionURL, "?", 2)
+							if len(urlParts) == 2 {
+								basePath := strings.Replace(urlParts[0], "xsxk_index", "yxxsxk_index", 1)
 								sessionURL = basePath + "?" + urlParts[1]
 								fmt.Printf("转换URL: %s => %s\n", href, sessionURL)
 							}
@@ -942,7 +950,7 @@ func getSessionList(cookies []*http.Cookie) ([]CourseSession, error) {
 				}
 			}
 
-			// Convert xklc_view URLs to xsxk_index URLs if needed
+			// Convert xklc_view URLs to yxxsxk_index URLs if needed
 			sessionURL := href
 
 			// Extract all parameters from the URL without assuming specific names
@@ -950,7 +958,15 @@ func getSessionList(cookies []*http.Cookie) ([]CourseSession, error) {
 				// Split the URL to get the path and parameters
 				urlParts := strings.SplitN(sessionURL, "?", 2)
 				if len(urlParts) == 2 {
-					basePath := strings.Replace(urlParts[0], "xklc_view", "xsxk_index", 1)
+					basePath := strings.Replace(urlParts[0], "xklc_view", "yxxsxk_index", 1)
+					sessionURL = basePath + "?" + urlParts[1]
+					fmt.Printf("转换URL: %s => %s\n", href, sessionURL)
+				}
+			} else if strings.Contains(sessionURL, "xsxk_index") {
+				// Also convert any xsxk_index URLs to yxxsxk_index
+				urlParts := strings.SplitN(sessionURL, "?", 2)
+				if len(urlParts) == 2 {
+					basePath := strings.Replace(urlParts[0], "xsxk_index", "yxxsxk_index", 1)
 					sessionURL = basePath + "?" + urlParts[1]
 					fmt.Printf("转换URL: %s => %s\n", href, sessionURL)
 				}
