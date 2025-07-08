@@ -35,6 +35,7 @@ type Course struct {
 	Jx0404id string     `json:"jx0404id"` // 选课ID
 	Szkcflmc string     `json:"szkcflmc"` // 通选课类别
 	KkapList []KkapInfo `json:"kkapList"` // 课程安排信息
+	Fzmc     string     `json:"fzmc"`     // 课程分组名称
 }
 
 // KkapInfo represents course arrangement information
@@ -54,7 +55,8 @@ type CourseResponse struct {
 
 // Global variables
 var courseMap map[string]string
-var selectedSession CourseSession // Store the selected session globally
+var courseSections map[string][]string // Maps course number (kch) to all section IDs (jx0404id)
+var selectedSession CourseSession      // Store the selected session globally
 
 func main() {
 	// Display disclaimer at startup
@@ -333,107 +335,209 @@ func refreshAuthentication(cookies []*http.Cookie) error {
 
 // getCourseList fetches the list of available courses
 func getCourseList(cookies []*http.Cookie) (map[string]string, error) {
-	data := "sEcho=1&iColumns=13&sColumns=&iDisplayStart=0&iDisplayLength=9999&mDataProp_0=kch&mDataProp_1=kcmc&mDataProp_2=xf&mDataProp_3=skls&mDataProp_4=sksj&mDataProp_5=skdd&mDataProp_6=xqmc&mDataProp_7=xxrs&mDataProp_8=xkrs&mDataProp_9=syrs&mDataProp_10=ctsm&mDataProp_11=szkcflmc&mDataProp_12=czOper"
+	// Create a map to store unique courses by jx0404id
+	allCourses := make(map[string]Course)      // jx0404id -> Course
+	coursesByKch := make(map[string][]Course)  // kch -> []Course
+	courseMap := make(map[string]string)       // jx0404id -> kch (reversed from before)
+	courseSections = make(map[string][]string) // kch -> []jx0404id
 
-	req, err := http.NewRequest("POST",
-		"https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/xsxkGgxxkxk?kcxx=&skls=&skxq=&skjc=&sfym=false&sfct=false&szjylb=&sfxx=true",
-		strings.NewReader(data))
-	if err != nil {
-		return nil, err
+	// Create a WaitGroup to synchronize the goroutines
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+
+	// Create a slice to collect errors
+	var errors []string
+	var errorsMutex sync.Mutex
+
+	fmt.Println("正在获取所有星期的课程数据...")
+
+	// Iterate through all days of the week (1-7)
+	for day := 1; day <= 7; day++ {
+		wg.Add(1)
+		go func(skxq int) {
+			defer wg.Done()
+
+			fmt.Printf("获取星期 %d 的课程...\n", skxq)
+
+			// Prepare the request data
+			data := "sEcho=1&iColumns=12&sColumns=&iDisplayStart=0&iDisplayLength=9999" +
+				"&mDataProp_0=kch&mDataProp_1=kcmc&mDataProp_2=fzmc&mDataProp_3=xf" +
+				"&mDataProp_4=skls&mDataProp_5=sksj&mDataProp_6=skdd&mDataProp_7=xqmc" +
+				"&mDataProp_8=xkrs&mDataProp_9=syrs&mDataProp_10=ctsm&mDataProp_11=czOper"
+
+			// Create the URL with the specific skxq parameter
+			url := fmt.Sprintf("https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/xsxkFawxk?kcxx=&skls=&skxq=%d&skjc=&sfym=false&sfct=false&sfxx=true&skxq_xx0103=&kzyxkbx=0&kzyxkxx=0&kzyxkrx=0&kzyxkqt=0", skxq)
+
+			req, err := http.NewRequest("POST", url, strings.NewReader(data))
+			if err != nil {
+				errorsMutex.Lock()
+				errors = append(errors, fmt.Sprintf("星期 %d 请求创建失败: %v", skxq, err))
+				errorsMutex.Unlock()
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+			req.Header.Set("Host", "jw.educationgroup.cn")
+
+			// Add cookies to request
+			for _, cookie := range cookies {
+				req.AddCookie(cookie)
+			}
+
+			client := &http.Client{}
+			resp, err := client.Do(req)
+			if err != nil {
+				errorsMutex.Lock()
+				errors = append(errors, fmt.Sprintf("星期 %d 请求发送失败: %v", skxq, err))
+				errorsMutex.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != 200 {
+				errorsMutex.Lock()
+				errors = append(errors, fmt.Sprintf("星期 %d 获取课程列表失败，状态码: %d", skxq, resp.StatusCode))
+				errorsMutex.Unlock()
+				return
+			}
+
+			// Read and parse the response
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				errorsMutex.Lock()
+				errors = append(errors, fmt.Sprintf("星期 %d 读取响应失败: %v", skxq, err))
+				errorsMutex.Unlock()
+				return
+			}
+
+			// Check if response is HTML instead of JSON
+			if strings.Contains(string(body), "<html") {
+				errorsMutex.Lock()
+				errors = append(errors, fmt.Sprintf("星期 %d 收到HTML响应而非JSON，会话可能已过期或认证失败", skxq))
+				errorsMutex.Unlock()
+				return
+			}
+
+			var courseResp CourseResponse
+			err = json.Unmarshal(body, &courseResp)
+			if err != nil {
+				errorsMutex.Lock()
+				errors = append(errors, fmt.Sprintf("星期 %d 解析JSON失败: %v", skxq, err))
+				errorsMutex.Unlock()
+				return
+			}
+
+			// Lock the mutex before updating the shared maps
+			mutex.Lock()
+			defer mutex.Unlock()
+
+			// Add courses to the maps
+			for _, course := range courseResp.AaData {
+				// Store by jx0404id to avoid duplicates
+				if _, exists := allCourses[course.Jx0404id]; !exists {
+					allCourses[course.Jx0404id] = course
+
+					// Group courses by kch
+					coursesByKch[course.Kch] = append(coursesByKch[course.Kch], course)
+
+					// Reverse mapping: jx0404id -> kch
+					courseMap[course.Jx0404id] = course.Kch
+				}
+			}
+
+			fmt.Printf("星期 %d 获取到 %d 门课程\n", skxq, len(courseResp.AaData))
+
+		}(day)
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("Host", "jw.educationgroup.cn")
+	// Wait for all goroutines to finish
+	wg.Wait()
 
-	// Add cookies to request
-	for _, cookie := range cookies {
-		req.AddCookie(cookie)
+	// Check if there were any errors
+	if len(errors) > 0 {
+		// If all days failed, return an error
+		if len(errors) == 7 {
+			return nil, fmt.Errorf("获取课程列表失败: %s", strings.Join(errors, "; "))
+		}
+
+		// Otherwise, just print the errors but continue
+		fmt.Println("\n获取课程时遇到以下错误:")
+		for _, err := range errors {
+			fmt.Printf("- %s\n", err)
+		}
+		fmt.Println("但仍然获取到了部分课程数据，将继续处理...")
 	}
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("failed to get course list with status code: %d", resp.StatusCode)
+	// If we didn't get any courses, return an error
+	if len(allCourses) == 0 {
+		return nil, fmt.Errorf("未能获取到任何课程数据")
 	}
 
-	// Read and parse the response
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	// Populate the courseSections map
+	for kch, courses := range coursesByKch {
+		var sectionIDs []string
+		for _, course := range courses {
+			sectionIDs = append(sectionIDs, course.Jx0404id)
+		}
+		courseSections[kch] = sectionIDs
 	}
-
-	// Check if response is HTML instead of JSON
-	if strings.Contains(string(body), "<html") {
-		return nil, fmt.Errorf("received HTML response instead of JSON, session might have expired or authentication failed")
-	}
-
-	var courseResp CourseResponse
-	err = json.Unmarshal(body, &courseResp)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a map of kch -> jx0404id
-	courseMap := make(map[string]string)
 
 	// Print table header
-	fmt.Println("\n可选课程列表:")
-	fmt.Printf("%-10s %-20s %-4s %-10s %-20s %-20s %-8s %-6s %-20s\n",
-		"课程编号", "课程名称", "学分", "教师", "上课时间", "上课地点", "上课校区", "剩余量", "通选课类别")
-	fmt.Println(strings.Repeat("-", 120))
+	fmt.Printf("\n共获取到 %d 门可选课程:\n", len(allCourses))
+	fmt.Printf("%-15s %-20s %-4s %-10s %-20s %-20s %-8s %-6s %-20s %-10s\n",
+		"选课ID", "课程名称", "学分", "教师", "上课时间", "上课地点", "上课校区", "剩余量", "通选课类别", "课程编号")
+	fmt.Println(strings.Repeat("-", 140))
 
-	for _, course := range courseResp.AaData {
-		courseMap[course.Kch] = course.Jx0404id
-
-		// Get teacher name
-		teacherName := course.Skls
-		if len(course.KkapList) > 0 && course.KkapList[0].Jgxm != "" {
-			teacherName = course.KkapList[0].Jgxm
-		}
-
-		// Get classroom
-		classroom := course.Skdd
-		if len(course.KkapList) > 0 && course.KkapList[0].Jsmc != "" {
-			classroom = course.KkapList[0].Jsmc
-		}
-
-		// Format course time
-		courseTime := course.Sksj
-		if courseTime == "" && len(course.KkapList) > 0 {
-			xq := ""
-			switch course.KkapList[0].Xq {
-			case "1":
-				xq = "星期一"
-			case "2":
-				xq = "星期二"
-			case "3":
-				xq = "星期三"
-			case "4":
-				xq = "星期四"
-			case "5":
-				xq = "星期五"
-			case "6":
-				xq = "星期六"
-			case "7":
-				xq = "星期日"
+	// Print each course grouped by course number
+	for _, courses := range coursesByKch {
+		for _, course := range courses {
+			// Get teacher name
+			teacherName := course.Skls
+			if len(course.KkapList) > 0 && course.KkapList[0].Jgxm != "" {
+				teacherName = course.KkapList[0].Jgxm
 			}
-			courseTime = fmt.Sprintf("%s %s %s", course.KkapList[0].Kkzc, xq, course.KkapList[0].Skjcmc)
-		}
 
-		// Format remaining spots
-		remainingSpots := course.Syrs
-		if remainingSpots == "0" {
-			remainingSpots = "满"
-		}
+			// Get classroom
+			classroom := course.Skdd
+			if len(course.KkapList) > 0 && course.KkapList[0].Jsmc != "" {
+				classroom = course.KkapList[0].Jsmc
+			}
 
-		// Print course info in a formatted way
-		fmt.Printf("%-10s %-20.20s %-4d %-10.10s %-20.20s %-20.20s %-8.8s %-6s %-20.20s\n",
-			course.Kch, course.Kcmc, course.Xf, teacherName, courseTime, classroom, course.Xqmc, remainingSpots, course.Szkcflmc)
+			// Format course time
+			courseTime := course.Sksj
+			if courseTime == "" && len(course.KkapList) > 0 {
+				xq := ""
+				switch course.KkapList[0].Xq {
+				case "1":
+					xq = "星期一"
+				case "2":
+					xq = "星期二"
+				case "3":
+					xq = "星期三"
+				case "4":
+					xq = "星期四"
+				case "5":
+					xq = "星期五"
+				case "6":
+					xq = "星期六"
+				case "7":
+					xq = "星期日"
+				}
+				courseTime = fmt.Sprintf("%s %s %s", course.KkapList[0].Kkzc, xq, course.KkapList[0].Skjcmc)
+			}
+
+			// Format remaining spots
+			remainingSpots := course.Syrs
+			if remainingSpots == "0" {
+				remainingSpots = "满"
+			}
+
+			// Print course info in a formatted way
+			fmt.Printf("%-15s %-20.20s %-4d %-10.10s %-20.20s %-20.20s %-8.8s %-6s %-20.20s %-10s\n",
+				course.Jx0404id, course.Kcmc, course.Xf, teacherName, courseTime, classroom, course.Xqmc, remainingSpots, course.Szkcflmc, course.Kch)
+		}
+		// Add a separator between different course numbers
+		fmt.Println(strings.Repeat("-", 140))
 	}
 
 	return courseMap, nil
@@ -446,7 +550,7 @@ func selectCourses(courseMap map[string]string) []string {
 	// Use a map to track unique course selections
 	selectedCoursesMap := make(map[string]struct{})
 
-	fmt.Println("\n请输入要选择的课程号，每行一个，输入 'done' 结束:")
+	fmt.Println("\n请输入要选择的选课ID，每行一个，输入 'done' 结束:")
 
 	for {
 		fmt.Print("> ")
@@ -459,20 +563,20 @@ func selectCourses(courseMap map[string]string) []string {
 
 		if _, exists := courseMap[input]; exists {
 			if _, alreadySelected := selectedCoursesMap[input]; alreadySelected {
-				fmt.Printf("课程 %s 已经添加过了，请勿重复添加\n", input)
+				fmt.Printf("选课ID %s 已经添加过了，请勿重复添加\n", input)
 			} else {
 				selectedCoursesMap[input] = struct{}{}
-				fmt.Printf("已添加课程: %s\n", input)
+				fmt.Printf("已添加选课ID: %s\n", input)
 			}
 		} else {
-			fmt.Printf("课程号 %s 不存在，请重新输入\n", input)
+			fmt.Printf("选课ID %s 不存在，请重新输入\n", input)
 		}
 	}
 
 	// Convert map keys to slice
 	var selectedCourses []string
-	for kch := range selectedCoursesMap {
-		selectedCourses = append(selectedCourses, kch)
+	for jx0404id := range selectedCoursesMap {
+		selectedCourses = append(selectedCourses, jx0404id)
 	}
 
 	fmt.Printf("\n已选择 %d 门课程\n", len(selectedCourses))
@@ -509,16 +613,13 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 	}()
 
 	// Start a goroutine for each course
-	for _, kch := range selectedCourses {
+	for _, jx0404id := range selectedCourses {
 		wg.Add(1)
-		go func(kch string) {
+		go func(jx0404id string) {
 			defer wg.Done()
 
-			jx0404id, exists := courseMap[kch]
-			if !exists {
-				fmt.Printf("课程 %s 在课程映射中不存在\n", kch)
-				return
-			}
+			// Get the course number for display purposes
+			kch := courseMap[jx0404id]
 
 			attempts := 0
 
@@ -529,17 +630,18 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 				// Refresh authentication before each attempt to ensure the session is valid
 				err := refreshAuthentication(cookies)
 				if err != nil {
-					fmt.Printf("课程 %s: 认证刷新失败: %v，等待重试...\n", kch, err)
+					fmt.Printf("课程 %s: 认证刷新失败: %v，等待重试...\n", jx0404id, err)
 					time.Sleep(1 * time.Second)
 					continue
 				}
 
-				url := fmt.Sprintf("https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/ggxxkxkOper?cfbs=null&jx0404id=%s&xkzy=&trjf=&_=%d",
+				// Use the new API endpoint for course selection
+				url := fmt.Sprintf("https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/fawxkOper?jx0404id=%s&xkzy=&trjf=&_=%d",
 					jx0404id, time.Now().UnixMilli())
 
 				req, err := http.NewRequest("GET", url, nil)
 				if err != nil {
-					fmt.Printf("课程 %s 请求创建失败: %v\n", kch, err)
+					fmt.Printf("课程 %s 请求创建失败: %v\n", jx0404id, err)
 					time.Sleep(1 * time.Second)
 					continue
 				}
@@ -554,7 +656,7 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 				client := &http.Client{}
 				resp, err := client.Do(req)
 				if err != nil {
-					fmt.Printf("课程 %s 请求发送失败: %v\n", kch, err)
+					fmt.Printf("课程 %s 请求发送失败: %v\n", jx0404id, err)
 					time.Sleep(1 * time.Second)
 					continue
 				}
@@ -562,13 +664,13 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 				body, err := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				if err != nil {
-					fmt.Printf("课程 %s 响应读取失败: %v\n", kch, err)
+					fmt.Printf("课程 %s 响应读取失败: %v\n", jx0404id, err)
 					time.Sleep(1 * time.Second)
 					continue
 				}
 
 				// Print response for debugging
-				fmt.Printf("课程 %s 响应: %s\n", kch, string(body))
+				fmt.Printf("课程 %s 响应: %s\n", jx0404id, string(body))
 
 				// Parse the response
 				var result struct {
@@ -578,20 +680,20 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 
 				err = json.Unmarshal(body, &result)
 				if err != nil {
-					fmt.Printf("课程 %s 响应解析失败: %v\n", kch, err)
+					fmt.Printf("课程 %s 响应解析失败: %v\n", jx0404id, err)
 					time.Sleep(1 * time.Second)
 					continue
 				}
 
 				if result.Success && result.Message == "选课成功" {
-					successChan <- kch
+					successChan <- fmt.Sprintf("%s (课程编号: %s)", jx0404id, kch)
 					return
 				}
 
-				fmt.Printf("课程 %s 尝试 %d: %s\n", kch, attempts, result.Message)
+				fmt.Printf("课程 %s 尝试 %d: %s\n", jx0404id, attempts, result.Message)
 				time.Sleep(1 * time.Second)
 			}
-		}(kch)
+		}(jx0404id)
 	}
 
 	// Wait for all goroutines to finish
