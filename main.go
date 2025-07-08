@@ -52,6 +52,10 @@ type CourseResponse struct {
 	AaData []Course `json:"aaData"`
 }
 
+// Global variables
+var courseMap map[string]string
+var selectedSession CourseSession // Store the selected session globally
+
 func main() {
 	// Display disclaimer at startup
 	fmt.Println("==============================================================================")
@@ -99,7 +103,8 @@ func main() {
 
 	fmt.Println("登录成功!")
 
-	// Step 3: Request authentication
+	// Step 3: Request initial authentication and select course session
+	fmt.Println("\n开始选课会话认证...")
 	err = authenticate(cookies)
 	if err != nil {
 		fmt.Printf("认证失败: %v\n", err)
@@ -107,6 +112,7 @@ func main() {
 	}
 
 	// Step 4: Get course list
+	fmt.Println("\n获取课程列表...")
 	var getCourseErr error
 	courseMap, getCourseErr = getCourseList(cookies)
 	if getCourseErr != nil {
@@ -118,6 +124,7 @@ func main() {
 	selectedCourses := selectCourses(courseMap)
 
 	// Step 6: Register for selected courses
+	fmt.Println("\n开始选课，将在每次尝试前自动刷新认证会话...")
 	registerForCourses(selectedCourses, cookies)
 }
 
@@ -239,7 +246,7 @@ func authenticate(cookies []*http.Cookie) error {
 
 	// Let user select a session
 	reader := bufio.NewReader(os.Stdin)
-	var selectedSession CourseSession
+	var localSelectedSession CourseSession
 
 	// Always require manual selection, even if there's only one option
 	for {
@@ -255,14 +262,32 @@ func authenticate(cookies []*http.Cookie) error {
 			continue
 		}
 
-		selectedSession = sessions[sessionIndex-1]
+		localSelectedSession = sessions[sessionIndex-1]
 		break
 	}
+
+	// Store the selected session in the global variable
+	selectedSession = localSelectedSession
 
 	fmt.Printf("\n已选择: %s - %s\n", selectedSession.Term, selectedSession.Name)
 	fmt.Printf("使用URL: %s\n", selectedSession.URL)
 
 	// Send authentication request with the selected session URL
+	err = refreshAuthentication(cookies)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("认证成功!")
+	return nil
+}
+
+// refreshAuthentication re-authenticates with the selected session URL
+func refreshAuthentication(cookies []*http.Cookie) error {
+	if selectedSession.URL == "" {
+		return fmt.Errorf("没有选择选课会话")
+	}
+
 	authURL := "https://jw.educationgroup.cn" + selectedSession.URL
 	req, err := http.NewRequest("GET", authURL, nil)
 	if err != nil {
@@ -303,7 +328,6 @@ func authenticate(cookies []*http.Cookie) error {
 		return fmt.Errorf("认证失败: 权限不足或会话已过期，请重新登录")
 	}
 
-	fmt.Println("认证成功!")
 	return nil
 }
 
@@ -502,6 +526,14 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 			for {
 				attempts++
 
+				// Refresh authentication before each attempt to ensure the session is valid
+				err := refreshAuthentication(cookies)
+				if err != nil {
+					fmt.Printf("课程 %s: 认证刷新失败: %v，等待重试...\n", kch, err)
+					time.Sleep(1 * time.Second)
+					continue
+				}
+
 				url := fmt.Sprintf("https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/ggxxkxkOper?cfbs=null&jx0404id=%s&xkzy=&trjf=&_=%d",
 					jx0404id, time.Now().UnixMilli())
 
@@ -566,9 +598,6 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 	wg.Wait()
 	doneChan <- true
 }
-
-// Global variable for course map
-var courseMap map[string]string
 
 // getSessionList fetches the list of available course selection sessions
 func getSessionList(cookies []*http.Cookie) ([]CourseSession, error) {
