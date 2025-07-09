@@ -52,9 +52,61 @@ type CourseResponse struct {
 	AaData []Course `json:"aaData"`
 }
 
+// APIResponse represents a generic API response with flexible success field
+type APIResponse struct {
+	Success interface{} `json:"success"` // Can be bool or []interface{}
+	Message string      `json:"message"`
+}
+
+// IsSuccess determines if an APIResponse indicates success
+func (r *APIResponse) IsSuccess() bool {
+	switch v := r.Success.(type) {
+	case bool:
+		return v
+	case []interface{}:
+		if len(v) > 0 {
+			if boolVal, ok := v[0].(bool); ok {
+				return boolVal
+			}
+		}
+	case map[string]interface{}:
+		// Some APIs might return success as an object with a status field
+		if status, ok := v["status"].(bool); ok {
+			return status
+		}
+	}
+	return false
+}
+
+// GetSuccessMessage returns a formatted success message
+func (r *APIResponse) GetSuccessMessage() string {
+	// First check if there's a standard message
+	if r.Message != "" {
+		return r.Message
+	}
+
+	// For array responses, check if there's a message in the array
+	if arr, ok := r.Success.([]interface{}); ok && len(arr) > 1 {
+		if msg, ok := arr[1].(string); ok {
+			return msg
+		}
+	}
+
+	// Default message
+	if r.IsSuccess() {
+		return "操作成功"
+	}
+	return "操作失败"
+}
+
 // Global variables
 var courseMap map[string]string
 var selectedSession CourseSession // Store the selected session globally
+var storedUsername string         // Store username for re-login
+var storedPassword string         // Store password for re-login
+var storedEncoded string          // Store encoded credentials for re-login
+var cookiesMutex sync.Mutex       // Mutex for protecting cookies
+var sharedCookies []*http.Cookie  // Shared cookies that can be updated by any goroutine
 
 func main() {
 	// Display disclaimer at startup
@@ -83,12 +135,17 @@ func main() {
 	password, _ := reader.ReadString('\n')
 	password = strings.TrimSpace(password)
 
+	// Store credentials for re-login if needed
+	storedUsername = username
+	storedPassword = password
+
 	// Encode username and password in base64
 	usernameBase64 := base64.StdEncoding.EncodeToString([]byte(username))
 	passwordBase64 := base64.StdEncoding.EncodeToString([]byte(password))
 
 	// Format exactly as in the example: MjAyMzEyMDA5Nzc4%25%25%25TGl1MDUwNDIw%3D
 	encoded := fmt.Sprintf("%s%%25%%25%%25%s%%3D", usernameBase64, passwordBase64)
+	storedEncoded = encoded
 
 	fmt.Println("编码后的登录参数:", encoded)
 
@@ -485,6 +542,11 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 	successChan := make(chan string)
 	doneChan := make(chan bool)
 
+	// Initialize shared cookies
+	cookiesMutex.Lock()
+	sharedCookies = cookies
+	cookiesMutex.Unlock()
+
 	// Start a goroutine to collect successful registrations
 	go func() {
 		successfulCourses := []string{}
@@ -521,10 +583,18 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 			}
 
 			attempts := 0
+			sessionExpiredCount := 0
+			lastReauthTime := time.Now().Add(-10 * time.Minute) // Initialize to past time
 
 			// Continue indefinitely until successful or manually stopped
 			for {
 				attempts++
+
+				// Get the latest cookies
+				cookiesMutex.Lock()
+				localCookies := make([]*http.Cookie, len(sharedCookies))
+				copy(localCookies, sharedCookies)
+				cookiesMutex.Unlock()
 
 				url := fmt.Sprintf("https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/ggxxkxkOper?cfbs=null&jx0404id=%s&xkzy=&trjf=&_=%d",
 					jx0404id, time.Now().UnixMilli())
@@ -539,7 +609,7 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 				req.Header.Set("Host", "jw.educationgroup.cn")
 
 				// Add cookies to request
-				for _, cookie := range cookies {
+				for _, cookie := range localCookies {
 					req.AddCookie(cookie)
 				}
 
@@ -559,28 +629,105 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 					continue
 				}
 
-				// Print response for debugging
-				fmt.Printf("课程 %s 响应: %s\n", kch, string(body))
+				// Check if response is HTML instead of JSON (session expired)
+				responseStr := string(body)
+				sessionExpired := false
+
+				if strings.Contains(responseStr, "<html") {
+					sessionExpired = true
+				} else if strings.Contains(responseStr, "请重新登录") ||
+					strings.Contains(responseStr, "已在别处登录") ||
+					strings.Contains(responseStr, "登录超时") {
+					sessionExpired = true
+				}
+
+				if sessionExpired {
+					sessionExpiredCount++
+
+					// Check if another goroutine has recently re-authenticated (within 5 seconds)
+					timeSinceLastReauth := time.Since(lastReauthTime)
+					if timeSinceLastReauth < 5*time.Second {
+						fmt.Printf("课程 %s 检测到会话过期，但另一个进程刚刚重新认证，等待使用新令牌...\n", kch)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+
+					fmt.Printf("课程 %s 会话已过期，准备重新登录...\n", kch)
+
+					// Re-login and refresh authentication
+					newCookies, loginErr := relogin()
+					if loginErr != nil {
+						fmt.Printf("课程 %s 重新登录失败: %v\n", kch, loginErr)
+						time.Sleep(3 * time.Second)
+						continue
+					}
+
+					// Update shared cookies for all goroutines
+					cookiesMutex.Lock()
+					sharedCookies = newCookies
+					lastReauthTime = time.Now()
+					cookiesMutex.Unlock()
+
+					fmt.Printf("课程 %s 已获取新的会话令牌，继续选课...\n", kch)
+					continue
+				}
+
+				fmt.Printf("课程 %s 响应: %s\n", kch, responseStr)
 
 				// Parse the response
-				var result struct {
-					Success bool   `json:"success"`
-					Message string `json:"message"`
-				}
+				var result APIResponse
 
 				err = json.Unmarshal(body, &result)
 				if err != nil {
 					fmt.Printf("课程 %s 响应解析失败: %v\n", kch, err)
+
+					// Check if the error might be due to session expiration
+					if strings.Contains(responseStr, "请重新登录") ||
+						strings.Contains(responseStr, "已在别处登录") ||
+						strings.Contains(responseStr, "登录超时") ||
+						strings.Contains(responseStr, "<html") {
+
+						fmt.Printf("课程 %s 检测到可能的会话过期，尝试重新认证...\n", kch)
+
+						// Check if another goroutine has recently re-authenticated
+						timeSinceLastReauth := time.Since(lastReauthTime)
+						if timeSinceLastReauth < 5*time.Second {
+							fmt.Printf("课程 %s 另一个进程刚刚重新认证，等待使用新令牌...\n", kch)
+							time.Sleep(1 * time.Second)
+							continue
+						}
+
+						// Re-login and refresh authentication
+						newCookies, loginErr := relogin()
+						if loginErr != nil {
+							fmt.Printf("课程 %s 重新登录失败: %v\n", kch, loginErr)
+							time.Sleep(3 * time.Second)
+							continue
+						}
+
+						// Update shared cookies for all goroutines
+						cookiesMutex.Lock()
+						sharedCookies = newCookies
+						lastReauthTime = time.Now()
+						cookiesMutex.Unlock()
+
+						fmt.Printf("课程 %s 已获取新的会话令牌，继续选课...\n", kch)
+					}
+
 					time.Sleep(1 * time.Second)
 					continue
 				}
 
-				if result.Success && result.Message == "选课成功" {
+				// Check for success - handle different success message variations
+				successMsg := result.GetSuccessMessage()
+				if result.IsSuccess() && (strings.Contains(successMsg, "选课成功") ||
+					strings.Contains(successMsg, "success") ||
+					strings.Contains(successMsg, "成功")) {
 					successChan <- kch
 					return
 				}
 
-				fmt.Printf("课程 %s 尝试 %d: %s\n", kch, attempts, result.Message)
+				fmt.Printf("课程 %s 尝试 %d: %s\n", kch, attempts, result.GetSuccessMessage())
 				time.Sleep(1 * time.Second)
 			}
 		}(kch)
@@ -589,6 +736,36 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 	// Wait for all goroutines to finish
 	wg.Wait()
 	doneChan <- true
+}
+
+// relogin performs the login process again and refreshes authentication
+func relogin() ([]*http.Cookie, error) {
+	fmt.Println("会话已过期，开始重新登录...")
+
+	// Use stored credentials
+	if storedEncoded == "" {
+		return nil, fmt.Errorf("没有存储的登录凭据")
+	}
+
+	fmt.Println("使用已存储的登录凭据...")
+
+	// Login and get new cookies
+	fmt.Println("正在重新获取登录令牌...")
+	cookies, err := login(storedEncoded)
+	if err != nil {
+		return nil, fmt.Errorf("重新登录失败: %v", err)
+	}
+
+	fmt.Println("重新登录成功，正在刷新选课会话认证...")
+
+	// Refresh authentication with the selected session
+	err = refreshAuthentication(cookies)
+	if err != nil {
+		return nil, fmt.Errorf("重新认证失败: %v", err)
+	}
+
+	fmt.Println("会话认证刷新成功!")
+	return cookies, nil
 }
 
 // getSessionList fetches the list of available course selection sessions
