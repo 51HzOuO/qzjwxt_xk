@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -127,7 +128,7 @@ func main() {
 
 	// Step 6: Register for selected courses
 	fmt.Println("\n开始选课，将在每次尝试前自动刷新认证会话...")
-	registerForCourses(selectedCourses, cookies)
+	registerForCourses(selectedCourses, cookies, encoded)
 }
 
 // login sends a login request and returns cookies
@@ -584,10 +585,85 @@ func selectCourses(courseMap map[string]string) []string {
 }
 
 // registerForCourses registers for the selected courses
-func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
+func registerForCourses(selectedCourses []string, cookies []*http.Cookie, encoded string) {
 	var wg sync.WaitGroup
 	successChan := make(chan string)
 	doneChan := make(chan bool)
+
+	// Create a channel for token refresh requests
+	tokenRefreshChan := make(chan bool)
+	tokenRefreshDoneChan := make(chan []*http.Cookie)
+	quitRefreshChan := make(chan bool) // Add a quit channel
+
+	// Create a mutex to protect shared cookies
+	var cookiesMutex sync.Mutex
+	sharedCookies := cookies
+
+	// Create an atomic flag to prevent multiple refresh requests
+	// When a goroutine detects token expiration, it checks this flag
+	// Only one goroutine will trigger the refresh process at a time
+	var isRefreshing int32
+
+	// Create a function to get the current cookies
+	getCookies := func() []*http.Cookie {
+		cookiesMutex.Lock()
+		defer cookiesMutex.Unlock()
+		return sharedCookies
+	}
+
+	// Create a function to update the shared cookies
+	updateCookies := func(newCookies []*http.Cookie) {
+		cookiesMutex.Lock()
+		defer cookiesMutex.Unlock()
+		sharedCookies = newCookies
+	}
+
+	// 使用传入的encoded参数，不再要求用户重新输入账号密码
+	fmt.Println("\n将使用之前的登录信息自动处理会话过期问题")
+
+	// Start a goroutine to handle token refresh
+	go func() {
+		for {
+			select {
+			case <-tokenRefreshChan:
+				// Set the refreshing flag
+				atomic.StoreInt32(&isRefreshing, 1)
+
+				fmt.Println("\n检测到会话已过期，正在重新登录...")
+
+				// Re-login
+				newCookies, err := login(encoded)
+				if err != nil {
+					fmt.Printf("重新登录失败: %v\n", err)
+					tokenRefreshDoneChan <- getCookies() // Return current cookies if login fails
+					atomic.StoreInt32(&isRefreshing, 0)  // Reset the refreshing flag
+					continue
+				}
+
+				fmt.Println("重新登录成功，正在刷新认证会话...")
+
+				// Re-authenticate with the selected session
+				err = refreshAuthentication(newCookies)
+				if err != nil {
+					fmt.Printf("刷新认证失败: %v\n", err)
+					tokenRefreshDoneChan <- getCookies() // Return current cookies if authentication fails
+					atomic.StoreInt32(&isRefreshing, 0)  // Reset the refreshing flag
+					continue
+				}
+
+				fmt.Println("认证会话刷新成功，更新共享会话令牌...")
+				updateCookies(newCookies)
+				tokenRefreshDoneChan <- newCookies
+
+				// Reset the refreshing flag
+				atomic.StoreInt32(&isRefreshing, 0)
+
+			case <-quitRefreshChan:
+				// Exit the goroutine when quit signal is received
+				return
+			}
+		}
+	}()
 
 	// Start a goroutine to collect successful registrations
 	go func() {
@@ -607,6 +683,8 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 				} else {
 					fmt.Println("没有成功选上任何课程")
 				}
+				// Signal the token refresh goroutine to exit
+				quitRefreshChan <- true
 				return
 			}
 		}
@@ -627,6 +705,9 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 			for {
 				attempts++
 
+				// Get the latest cookies
+				localCookies := getCookies()
+
 				// Use the new API endpoint for course selection
 				url := fmt.Sprintf("https://jw.educationgroup.cn/ytkjxy_jsxsd/xsxkkc/fawxkOper?jx0404id=%s&xkzy=&trjf=&_=%d",
 					jx0404id, time.Now().UnixMilli())
@@ -641,7 +722,7 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 				req.Header.Set("Host", "jw.educationgroup.cn")
 
 				// Add cookies to request
-				for _, cookie := range cookies {
+				for _, cookie := range localCookies {
 					req.AddCookie(cookie)
 				}
 
@@ -661,13 +742,63 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 					continue
 				}
 
-				// Print response for debugging
-				fmt.Printf("课程 %s 响应: %s\n", jx0404id, string(body))
+				bodyStr := string(body)
+
+				// 检查是否需要重新登录 - 两种情况:
+				// 1. 响应是HTML而不是JSON (表示token过期)
+				// 2. 响应是JSON但包含"当前账号已在别处登录"信息
+				needRelogin := strings.Contains(bodyStr, "<html") ||
+					strings.Contains(bodyStr, "当前账号已在别处登录") ||
+					strings.Contains(bodyStr, "请重新登录")
+
+				if needRelogin {
+					var reason string
+					if strings.Contains(bodyStr, "<html") {
+						reason = "收到HTML响应"
+					} else {
+						reason = "账号在别处登录或会话已过期"
+					}
+
+					fmt.Printf("课程 %s %s，会话可能已过期\n", jx0404id, reason)
+
+					// Check if a refresh is already in progress
+					// CompareAndSwap atomically sets isRefreshing to 1 if it was 0 and returns true
+					// This ensures only one goroutine will trigger the refresh process
+					if atomic.CompareAndSwapInt32(&isRefreshing, 0, 1) {
+						// We're the first to trigger a refresh
+						fmt.Printf("课程 %s 正在触发会话刷新...\n", jx0404id)
+
+						// Reset the flag (the refresh goroutine will set it properly)
+						atomic.StoreInt32(&isRefreshing, 0)
+
+						// Request token refresh
+						tokenRefreshChan <- true
+					} else {
+						fmt.Printf("课程 %s 等待会话刷新完成...\n", jx0404id)
+					}
+
+					// All goroutines that detect token expiration will wait here
+					// They will each receive the new cookies when refresh is complete
+					newCookies := <-tokenRefreshDoneChan
+
+					// Explicitly use the new cookies for the next request
+					localCookies = newCookies
+
+					fmt.Printf("课程 %s 已获取新的会话令牌，继续选课...\n", jx0404id)
+					continue
+				}
+
+				// Print response for debugging (without HTML content)
+				if !strings.Contains(bodyStr, "<html") {
+					fmt.Printf("课程 %s 响应: %s\n", jx0404id, bodyStr)
+				} else {
+					fmt.Printf("课程 %s 收到HTML响应 (内容已省略)\n", jx0404id)
+				}
 
 				// Parse the response
 				var result struct {
-					Success bool   `json:"success"`
-					Message string `json:"message"`
+					Success interface{} `json:"success"`
+					Message string      `json:"message"`
 				}
 
 				err = json.Unmarshal(body, &result)
@@ -677,7 +808,23 @@ func registerForCourses(selectedCourses []string, cookies []*http.Cookie) {
 					continue
 				}
 
-				if result.Success && result.Message == "选课成功" {
+				// 处理success字段可能是布尔值或数组的情况
+				var isSuccess bool
+				switch v := result.Success.(type) {
+				case bool:
+					isSuccess = v
+				case []interface{}:
+					// 如果是数组，检查第一个元素是否为true
+					if len(v) > 0 {
+						if b, ok := v[0].(bool); ok {
+							isSuccess = b
+						}
+					}
+				default:
+					isSuccess = false
+				}
+
+				if isSuccess && result.Message == "选课成功" {
 					successChan <- fmt.Sprintf("%s (课程编号: %s)", jx0404id, kch)
 					return
 				}
